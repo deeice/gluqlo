@@ -20,7 +20,12 @@
 
 #include <stdlib.h>
 #include <string.h>
+#ifndef ZIPIT_Z2
 #include <X11/Xlib.h>
+#include <stdbool.h>
+#else
+#include <stdio.h>
+#endif
 #include <time.h>
 
 #include "SDL.h"
@@ -33,14 +38,30 @@
 #define FONT "/usr/share/gluqlo/gluqlo.ttf"
 #endif
 
+#ifndef ZIPIT_Z2
 const char* TITLE = "Gluqlo 1.1";
-const int DEFAULT_WIDTH = 1024;
-const int DEFAULT_HEIGHT = 768;
+#define DEFAULT_WIDTH  1024;
+#define DEFAULT_HEIGHT 768;
 
 bool twentyfourh = true;
 bool leadingzero = false;
 bool fullscreen = false;
 bool animate = true;
+bool redshift = false;
+#else
+const char* TITLE = "Gluqlo 1.1z";
+#define DEFAULT_WIDTH  320;
+#define DEFAULT_HEIGHT 240;
+#define bool int
+#define true  1
+#define false 0
+
+bool twentyfourh = false;
+bool leadingzero = false;
+bool fullscreen = true;
+bool animate = true;
+bool redshift = false;
+#endif
 
 int past_h = -1, past_m = -1;
 
@@ -52,6 +73,7 @@ TTF_Font *font_mode = NULL;
 
 const SDL_Color FONT_COLOR = { 0xb7, 0xb7, 0xb7 };
 const SDL_Color BACKGROUND_COLOR = { 0x0f, 0x0f, 0x0f };
+const SDL_Color RED_COLOR = { 0xb7, 0x0, 0x0 };
 
 SDL_Surface *screen;
 
@@ -60,6 +82,44 @@ SDL_Rect minBackground;
 
 SDL_Rect bgrect;
 SDL_Surface *bg;
+
+/*
+# Linux 3.x sysfs backlight paths, trailing slash required!!
+#scrbfile = /sys/class/backlight/pwm-backlight.0/           # screen backlight
+#keybfile = /sys/class/backlight/pwm-backlight.1/           # keyboard backlight
+
+# Linux 4.x sysfs backlight paths, trailing slash required!!
+scrbfile = /sys/class/backlight/pxabus:display-backlight/   # screen backlight
+keybfile = /sys/class/backlight/pxabus:keyboard-backlight/  # keyboard backlight
+
+# read and write brightness file in that path.
+# (or maybe read actual-brightness file)
+
+evdev = /dev/input/event0   # keyboard device
+
+# Linux 3.x brightness values are 0-1023
+# Linux 4.x brightness values are 0-9
+
+brightscr = 8	        # screen brightness on AC
+brightkeyb = 2	        # keyboard brightness on AC
+
+dimscr = 3		        # screen brightness on Battery
+dimkeyb = 1		        # keyboard brightness on Battery
+
+# Timeout is seconds * 100: 5 seconds = 500, 60 seconds = 6000
+lcdtimeout = 6000       # screen off timeout on Battery
+keytimeout = 500        # keyboard off timeout on Battery
+*/
+
+#define scrbfile  "/sys/class/backlight/pxabus:display-backlight/brightness"   
+#define keybfile "/sys/class/backlight/pxabus:keyboard-backlight/brightness"
+
+FILE *scr;
+FILE *kbd;
+char buff[2] = {0, 0};
+int scr_dim[5] = {4,2,1,2,4}; // 3 clock brightness levels, and saved.
+int kbd_dim[5] = {1,1,0,1,1}; // saved, twilight, sleep, twilight, day
+int dimval = 0;
 
 // draw rounded box
 // see http://lists.libsdl.org/pipermail/sdl-libsdl.org/2006-December/058868.html
@@ -94,8 +154,9 @@ void fill_rounded_box_b(SDL_Surface* dst, SDL_Rect *coords, int r, SDL_Color col
 	int d = -r;
 	int x2m1 = -1;
 	int y = r;
+	int x;
 
-	for(int x = 0; x <= rpsqrt2; x++) {
+	for(x = 0; x <= rpsqrt2; x++) {
 		x2m1 += 2;
 		d += x2m1;
 		if(d >= 0) {
@@ -126,8 +187,12 @@ void fill_rounded_box_b(SDL_Surface* dst, SDL_Rect *coords, int r, SDL_Color col
 void render_ampm(SDL_Surface *surface, SDL_Rect *rect, int pm) {
 	char mode[3];
 	SDL_Rect coords;
+        SDL_Surface *ampm;
 	snprintf(mode, 3, "%cM", pm ? 'P' : 'A');
-	SDL_Surface *ampm = TTF_RenderText_Blended(font_mode, mode, FONT_COLOR);
+	if (redshift)
+          ampm = TTF_RenderText_Blended(font_mode, mode, RED_COLOR);
+        else 
+          ampm = TTF_RenderText_Blended(font_mode, mode, FONT_COLOR);
 	int offset = rect->h * 0.127;
 	coords.x = rect->x + rect->h * 0.07;
 	coords.y = rect->y + (pm ? rect->h - offset - ampm->h : offset);
@@ -186,7 +251,10 @@ void render_digits(SDL_Surface *surface, SDL_Rect *background, char digits[], ch
 	rect.h = background->h/2;
 	SDL_SetClipRect(surface, &rect);
 	SDL_BlitSurface(bg, 0, surface, &rect);
-	blit_digits(surface, background, spc, digits, FONT_COLOR);
+	if (redshift)
+	  blit_digits(surface, background, spc, digits, RED_COLOR);
+	else
+	  blit_digits(surface, background, spc, digits, FONT_COLOR);
 	SDL_SetClipRect(surface, NULL);
 
 	int halfsteps = maxsteps / 2;
@@ -199,6 +267,8 @@ void render_digits(SDL_Surface *surface, SDL_Rect *background, char digits[], ch
 		c = 0xb7 * ((1.0 * step) - halfsteps + 1) / halfsteps;
 	}
 	color.r = color.g = color.b = c;
+	if (redshift)
+	  color.g = color.b = 0x0;
 
 	// create surface to scale from filled background surface
 	SDL_Surface *bgcopy = SDL_ConvertSurface(bg, bg->format, bg->flags);
@@ -321,16 +391,28 @@ Uint32 update_time(Uint32 interval, void *param) {
 	return interval;
 }
 
+void dimmer(void) {
+    if (scr){
+        fprintf(scr, "%d", scr_dim[dimval]); fflush(scr);
+    }
+    if (kbd){
+        fprintf(kbd, "%d", kbd_dim[dimval]); fflush(kbd);
+    }
+}
+
 int main(int argc, char** argv ) {
 	char *wid_env;
-	static char sdlwid[100];
 	double display_scale_factor = 1;
+	int i;
 
 	Uint32 wid = 0;
+#ifndef ZIPIT_Z2
+	static char sdlwid[100];
 	Display *display;
 	XWindowAttributes windowAttributes;
+#endif
 
-	for(int i = 1; i < argc; i++) {
+	for(i = 1; i < argc; i++) {
 		if(strcmp("--help",argv[i]) == 0 || strcmp("-help", argv[i]) == 0) {
 			printf("Usage: %s [OPTION...]\nOptions:\n", argv[0]);
 			printf("  -help\t\tDisplay this\n");
@@ -351,6 +433,8 @@ int main(int argc, char** argv ) {
 			twentyfourh = false;
 		} else if(strcmp("-leadingzero", argv[i]) == 0) {
 			leadingzero = true;
+		} else if(strcmp("-red", argv[i]) == 0) {
+			redshift = true;
 		} else if(strcmp("-r", argv[i]) == 0 || strcmp("--resolution", argv[i]) == 0) {
 			char *resolution = argv[i+1];
 			char *val = strtok(resolution, "x");
@@ -383,7 +467,7 @@ int main(int argc, char** argv ) {
 			wid = strtol(wid_env, (char **) NULL, 0); /* Base 0 autodetects hex/dec */
 		}
 	}
-
+#ifndef ZIPIT_Z2
 	/* Get win attrs if we've been given a window, otherwise we'll use our own */
 	if(wid != 0) {
 		if ((display = XOpenDisplay(NULL)) != NULL) { /* Use the default display */
@@ -395,7 +479,20 @@ int main(int argc, char** argv ) {
 			height = windowAttributes.height;
 		}
 	}
-
+#else
+        if (scr = fopen(scrbfile, "r")) {
+          if (1 == fread(buff, 1, 1, scr)) //while (fgets(buff, 255, scr) != NULL)
+          sscanf(buff, "%d", &scr_dim[0]);
+          fclose(scr);
+          scr = fopen(scrbfile, "w"); // Reopen for writing to dim it
+        }
+        if (kbd = fopen(keybfile, "r")) {
+          if (1 == fread(buff, 1, 1, kbd)) //while (fgets(buff, 255, kbd) != NULL)
+          sscanf(buff, "%d", &kbd_dim[0]);
+          fclose(kbd);
+          kbd = fopen(keybfile, "w");
+        }
+#endif
 	if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER) < 0) {
 		fprintf(stderr, "Unable to init SDL: %s\n", SDL_GetError());
 		return 1;
@@ -469,6 +566,15 @@ int main(int argc, char** argv ) {
 	// draw current time
 	render_clock(20, 19);
 
+#ifdef ZIPIT_Z2
+        // Automagic adapt brightness at start..
+        dimval = 5;        // Assume its daytime.
+        if (past_h > 21)
+            dimval = 2;    // darken up for night at 10pm
+        else if (past_h > 17)
+            dimval = 1;    // dim for evening at 6pm
+        dimmer();
+#endif
 	// main loop
 	bool done = false;
 	SDL_Event event;
@@ -477,6 +583,18 @@ int main(int argc, char** argv ) {
 	while(!done && SDL_WaitEvent(&event)) {
 		switch(event.type) {
 			case SDL_USEREVENT:
+#ifdef ZIPIT_Z2
+				// Automagic adapt brightness as time passes.
+				// 0=default/Day, 1=evening, 2=sleep, 3=morning
+				if (past_m == 59) {
+				  if ((past_h == 17) && (dimval != 2))
+				    dimval = 1;   // darken up for evening at 6pm
+				  if ((past_h == 21) && (dimval != 2))
+				    dimval = 2;    // darken up for night at 10pm
+				  if ((past_h == 5) && (dimval != 0))
+				    dimval = 3; // brighten up for morning at 6am
+				}
+#endif
 				render_animation();
 				break;
 			case SDL_KEYDOWN:
@@ -484,6 +602,14 @@ int main(int argc, char** argv ) {
 					case SDLK_ESCAPE:
 					case SDLK_q:
 						done = true;
+#ifdef ZIPIT_Z2
+                                                dimval = -1; // Restore original dim level before quitting.
+					case SDLK_TAB:
+					case SDLK_SPACE:
+                                                if (++dimval >= 5)
+                                                  dimval = 1;
+                                                dimmer();
+#endif
 						break;
 					default:
 						break;
