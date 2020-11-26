@@ -61,6 +61,7 @@ bool leadingzero = false;
 bool fullscreen = true;
 bool animate = true;
 bool redshift = false;
+
 #endif
 
 int past_h = -1, past_m = -1;
@@ -109,17 +110,56 @@ dimkeyb = 1		        # keyboard brightness on Battery
 # Timeout is seconds * 100: 5 seconds = 500, 60 seconds = 6000
 lcdtimeout = 6000       # screen off timeout on Battery
 keytimeout = 500        # keyboard off timeout on Battery
+
+
+# Probably want to zero the charging/charged leds in clock mode
+# Once written, these never go back to displaying charging status.
+# Not really a problem for me as I leave the clock zipit plugged in.
+
+#could just turn the brightness to zero.
+echo "0" > /sys/class/leds/z2\:amber\:charging/brightness
+echo "0" > /sys/class/leds/z2\:green\:charged/brightness
+
+# But changing the trigger to "none" also turns them off, and keeps them off.
+echo "none" > /sys/class/leds/z2\:amber\:charging/trigger
+echo "none" > /sys/class/leds/z2\:green\:charged/trigger
+
+# Then later, do this to restore leds:  
+/etc/init.d/S11z2-leds start
+
+# S11z2-leds start does this (sadly, restart looks like it does nothing)
+	echo "mmc0" > /sys/class/leds/z2\:green\:wifi/trigger
+	echo "Z2-full" > /sys/class/leds/z2\:green\:charged/trigger
+	echo "Z2-charging" > /sys/class/leds/z2\:amber\:charging/trigger
+	STAT=`cat /sys/class/power_supply/Z2/status)`
+	if [ "$STAT" == "Charging" ]; then
+		echo "255" > /sys/class/leds/z2\:amber\:charging/brightness
+	elif [ "$STAT" == "Full" ]; then
+		echo "255" > /sys/class/leds/z2\:green\:charged/brightness
+	fi
+
+ebindkeys uses leds for notification beeper by setting trigger to "heartbeat" or "none"
+        echo "heartbeat" > /sys/class/leds/z2\:amber\:charging/trigger
+
+To set a notification try:  kill -12 `pidof ebindkeys`
+To deactivate, press a key or open/close the lid.
+
 */
 
 #define scrbfile  "/sys/class/backlight/pxabus:display-backlight/brightness"   
 #define keybfile "/sys/class/backlight/pxabus:keyboard-backlight/brightness"
+//#define led1file "/sys/class/leds/z2\:amber\:charging/trigger"
+//#define led2file "/sys/class/leds/z2\:green\:charged/trigger"
 
 FILE *scr;
 FILE *kbd;
+//FILE *led;
 char buff[2] = {0, 0};
 int scr_dim[5] = {4,2,1,2,4}; // 3 clock brightness levels, and saved.
 int kbd_dim[5] = {1,1,0,1,1}; // saved, twilight, sleep, twilight, day
 int dimval = 0;
+char *waketime = NULL;
+int wake_h = -1, wake_m = -1;
 
 // draw rounded box
 // see http://lists.libsdl.org/pipermail/sdl-libsdl.org/2006-December/058868.html
@@ -200,7 +240,35 @@ void render_ampm(SDL_Surface *surface, SDL_Rect *rect, int pm) {
 	SDL_FreeSurface(ampm);
 }
 
-
+#ifdef ZIPIT_Z2
+void render_alarm(SDL_Surface *surface, int h, int m) {
+	char buf[8];
+	SDL_Rect coords;
+        SDL_Surface *alrm;
+        snprintf(buf, 8, "%02d", m); //snprintf(buf, 8, "%d%02d", h, m);
+	if (redshift)
+          alrm = TTF_RenderText_Blended(font_mode, buf, RED_COLOR);
+        else 
+          alrm = TTF_RenderText_Blended(font_mode, buf, FONT_COLOR);
+        coords.x = screen->w - (alrm->w + 4);
+        coords.y = screen->h - (alrm->h + 4);
+	SDL_BlitSurface(alrm, 0, surface, &coords);
+	SDL_FreeSurface(alrm);
+        
+        if(leadingzero)
+          snprintf(buf, 8, "%02d", h);
+        else
+          snprintf(buf, 8, "%d", h);
+	if (redshift)
+          alrm = TTF_RenderText_Blended(font_mode, buf, RED_COLOR);
+        else 
+          alrm = TTF_RenderText_Blended(font_mode, buf, FONT_COLOR);
+        coords.x = coords.x - (alrm->w + 4);
+        // coords.y = screen->h - (alrm->h + 4);
+	SDL_BlitSurface(alrm, 0, surface, &coords);
+	SDL_FreeSurface(alrm);
+}
+#endif
 
 void blit_digits(SDL_Surface *surface, SDL_Rect *rect, int spc, char digits[], SDL_Color color) {
 	int min_x, max_x, min_y, max_y, advance;
@@ -391,13 +459,14 @@ Uint32 update_time(Uint32 interval, void *param) {
 	return interval;
 }
 
-void dimmer(void) {
+int dimmer(int d) {
     if (scr){
-        fprintf(scr, "%d", scr_dim[dimval]); fflush(scr);
+        fprintf(scr, "%d", scr_dim[d]); fflush(scr);
     }
     if (kbd){
-        fprintf(kbd, "%d", kbd_dim[dimval]); fflush(kbd);
+        fprintf(kbd, "%d", kbd_dim[d]); fflush(kbd);
     }
+    return d;
 }
 
 int main(int argc, char** argv ) {
@@ -441,6 +510,9 @@ int main(int argc, char** argv ) {
 			width = atoi(val);
 			val = strtok(NULL, "x");
 			height = atoi(val);
+			i++;
+		} else if(strcmp("-wake", argv[i]) == 0) {
+			waketime = argv[i+1];
 			i++;
 		} else if(strcmp("-w", argv[i]) == 0) {
 			width = atoi(argv[i+1]);
@@ -563,6 +635,15 @@ int main(int argc, char** argv ) {
 	bg = SDL_CreateRGBSurface(SDL_HWSURFACE|SDL_SRCALPHA, rectsize, rectsize, 32, 0xff000000, 0x00ff0000, 0x0000ff00, 0x000000ff);
 	fill_rounded_box_b(bg, &bgrect, radius, BACKGROUND_COLOR);
 
+#ifdef ZIPIT_Z2
+        // Maybe print small text bottom right for alarm at 715am
+        //   gets fuzzy over time because blended text.
+        //   Draw only twice?  To hit both buffs in doublebuffer?
+        if (waketime) {
+          if (2 == sscanf(waketime, "%d:%0d", &wake_h, &wake_m))
+            render_alarm(screen, wake_h, wake_m);
+        }
+#endif
 	// draw current time
 	render_clock(20, 19);
 
@@ -573,7 +654,17 @@ int main(int argc, char** argv ) {
             dimval = 2;    // darken up for night at 10pm
         else if (past_h > 17)
             dimval = 1;    // dim for evening at 6pm
-        dimmer();
+        else if (past_h < 6)
+            dimval = 2;    // dim for morning before 6am
+        dimmer(dimval);
+//        if (led = fopen(led1file, "w")) {
+//          fprintf(led, "none");
+//          fclose(kbd);
+//        }
+//        if (led = fopen(led2file, "w")) {
+//          fprintf(led, "none");
+//          fclose(kbd);
+//        }
 #endif
 	// main loop
 	bool done = false;
@@ -587,12 +678,14 @@ int main(int argc, char** argv ) {
 				// Automagic adapt brightness as time passes.
 				// 0=default/Day, 1=evening, 2=sleep, 3=morning
 				if (past_m == 59) {
-				  if ((past_h == 17) && (dimval != 2))
-				    dimval = 1;   // darken up for evening at 6pm
-				  if ((past_h == 21) && (dimval != 2))
-				    dimval = 2;    // darken up for night at 10pm
-				  if ((past_h == 5) && (dimval != 0))
-				    dimval = 3; // brighten up for morning at 6am
+                                  if ((past_h == 17) && (dimval != 2)) 
+                                    dimval = dimmer(1);   // darken up for evening at 6pm
+                                  if ((past_h == 21) && (dimval != 2)) 
+                                    dimval = dimmer(2);   // darken up for night at 10pm
+                                  if ((past_h == 5) && (dimval != 4)) 
+                                    dimval = dimmer(1);   // brighten up for morning at 6am
+                                  if ((past_h == 8) && (dimval != 4)) 
+                                    dimval = dimmer(4);   // light up for day at 9am
 				}
 #endif
 				render_animation();
@@ -604,11 +697,12 @@ int main(int argc, char** argv ) {
 						done = true;
 #ifdef ZIPIT_Z2
                                                 dimval = -1; // Restore original dim level before quitting.
+                                                // Also need to run "/etc/init.d/S11z2-leds start"
 					case SDLK_TAB:
 					case SDLK_SPACE:
                                                 if (++dimval >= 5)
                                                   dimval = 1;
-                                                dimmer();
+                                                dimmer(dimval);
 #endif
 						break;
 					default:
